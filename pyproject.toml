@@ -1,0 +1,20 @@
+[project]
+name = "HapticLens"
+version = "0.1.0"
+description = "Public release of the HapticLens video-to-haptics pipeline."
+readme = "README.md"
+requires-python = ">=3.11,<3.12"
+dependencies = [
+    "cupy-cuda12x>=13.6.0",
+    "dearpygui>=2.1.0",
+    "matplotlib>=3.9.0",
+    "numpy>=2.2,<2.3",
+    "opencv-python-headless>=4.12.0.88",
+    "pillow>=11.0.0",
+    "scipy>=1.16.0",
+    "vedo==2025.5.3",
+    "websocket-client>=1.9.0",
+]
+
+[tool.black]
+line-length = 175
