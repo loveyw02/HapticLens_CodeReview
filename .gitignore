@@ -6,9 +6,6 @@ videos/userstudy_haptics/*
 videos/synthetic/*
 videos/test/*
 
-tools/ffmpeg/
-tools/ffmpeg-release-essentials.zip
-
 trace.json
 phase_delta_avg.*
 phase_delta_dir_sum.*
