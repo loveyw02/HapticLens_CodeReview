@@ -32,7 +32,7 @@ COLOR_TEXT_LOWPRI = (175, 175, 175)
 ## constants
 EPS = 1e-6  # factor to avoid division by 0
 
-USER_STUDY_SAVE_DIR = Path("userstudy")
+USER_STUDY_SAVE_DIR = Path("videos/userstudy")
 USER_STUDY_VIDEOS_AND_ALGORITHMS: List[Tuple[str, int] | str] = [
     ("videos/userstudy/training.mp4", 0),
 
@@ -278,7 +278,7 @@ if user_study_mode is not None:
         raise ValueError("User Study AB Flip must be provided (e.g. 'normal' or 'flip').")
     else:
         user_study_participant_save_dir = USER_STUDY_SAVE_DIR / Path(user_study_participant_id)
-        user_study_participant_save_dir.mkdir(parents=False, exist_ok=True)
+        user_study_participant_save_dir.mkdir(parents=True, exist_ok=True)
         next_task = USER_STUDY_VIDEOS_AND_ALGORITHMS[user_study_video_idx]
         if isinstance(next_task, str):
             raise ValueError(f"Unexpected task in user study: {next_task}. Expected a video path and algorithm index.")
