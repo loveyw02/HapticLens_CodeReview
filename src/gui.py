@@ -26,6 +26,7 @@ from quest_websocket import QuestWebSocketClient
 from threading import Timer
 
 from event_logger import EventLogger
+from pose_detector import BODY_PART_NAMES, BodyPartSignal, PoseAnalysis, analyze_pose_video, draw_pose_overlay, extract_body_part_signal, merge_person_tracks
 
 COLOR_TEXT_LOWPRI = (175, 175, 175)
 
@@ -57,6 +58,19 @@ class TrainingStep:
     text: str
     outlined_widgets: List[str]
     check_done: Callable[[], bool]
+
+@dataclass
+class PoseHapticTrack:
+    person_id: int
+    body_part: str
+    actuator_id: str
+    signal_at_coords: np.ndarray
+    hap_signal: np.ndarray
+    valid_frames: np.ndarray
+
+    @property
+    def label(self) -> str:
+        return f"Person {self.person_id} {self.body_part} -> {self.actuator_id}"
 
 training_idx = 0
 in_training = False
@@ -332,7 +346,7 @@ def submit_signal_callback(sender, app_data, user_data):
             return
         last_submit_at = time.time()
 
-        logger.log("Submit Signal", f"video_path={video_path}, video_processing_method={video_processing_method}, extract_point={extract_point}, extract_radius={extract_radius}, subtract_global_avg={subtract_global_avg}, rms_instead_of_mean={rms_instead_of_mean}, use_ang_extraction={use_ang_extraction}")
+        logger.log("Submit Signal", f"video_path={video_path}, video_processing_method={video_processing_method}, extract_point={extract_point}, extract_radius={extract_radius}, subtract_global_avg={subtract_global_avg}, rms_instead_of_mean={rms_instead_of_mean}, use_ang_extraction={use_ang_extraction}, pose_tracks={len(pose_haptic_tracks)}")
         next_vid, next_algo_int = USER_STUDY_VIDEOS_AND_ALGORITHMS[user_study_video_idx]
         assert next_algo_int in (0, 1), f"Unexpected algorithm index {next_algo_int} for user study video {next_vid}"
         if not user_study_participant_save_dir:
@@ -343,6 +357,10 @@ def submit_signal_callback(sender, app_data, user_data):
             # np.save(str(out_file), hap_signal)
             scipy.io.wavfile.write(out_file, 8000, hap_signal)
             print(f"saved hap_signal -> {out_file}")
+            for pose_track in pose_haptic_tracks:
+                pose_out_file = user_study_participant_save_dir / f"{current_name}__{next_algo_int}_{pose_track.actuator_id}_{time.time()}.wav"
+                scipy.io.wavfile.write(pose_out_file, 8000, pose_track.hap_signal)
+                print(f"saved pose hap_signal -> {pose_out_file}")
 
     user_study_video_idx = user_study_video_idx + 1
 
@@ -816,6 +834,183 @@ def proc_type_radio_callback(sender, app_data, user_data):
     process_params_changed = True
     logger.log("Algorithm Changed", f"{video_processing_method}")
 
+pose_analysis: Optional[PoseAnalysis] = None
+pose_selected_people: set[int] = set()
+pose_selected_body_parts: set[str] = set(BODY_PART_NAMES)
+pose_haptic_tracks: list[PoseHapticTrack] = []
+pose_track_plot_tags: list[str] = []
+pose_model_path = "yolo11n-pose.pt"
+pose_confidence = 0.35
+pose_track_match_threshold = 0.15
+pose_max_frame_gap = 12
+pose_min_track_frames = 3
+pose_min_keypoint_confidence = 0.25
+pose_merge_ids = ""
+
+def _set_pose_status(text: str) -> None:
+    if dpg.does_item_exist("pose_status"):
+        dpg.set_value("pose_status", text)
+
+def _selected_pose_tracks():
+    if pose_analysis is None:
+        return []
+    return [track for track in pose_analysis.tracks if track.track_id in pose_selected_people]
+
+def update_pose_person_selection(sender, app_data, user_data):
+    track_id = int(user_data)
+    if app_data:
+        pose_selected_people.add(track_id)
+    else:
+        pose_selected_people.discard(track_id)
+    _set_pose_status(f"{len(pose_selected_people)} people selected.")
+
+def update_pose_body_part_selection(sender, app_data, user_data):
+    body_part = str(user_data)
+    if app_data:
+        pose_selected_body_parts.add(body_part)
+    else:
+        pose_selected_body_parts.discard(body_part)
+    _set_pose_status(f"{len(pose_selected_body_parts)} body parts selected.")
+
+def rebuild_pose_people_ui() -> None:
+    if not dpg.does_item_exist("pose_people_group"):
+        return
+    dpg.delete_item("pose_people_group", children_only=True)
+    if pose_analysis is None or len(pose_analysis.tracks) == 0:
+        dpg.add_text("No people detected.", parent="pose_people_group")
+        return
+    for track in pose_analysis.tracks:
+        label = f"{track.display_name} ({len(track.poses)} frames)"
+        dpg.add_checkbox(
+            label=label,
+            default_value=track.track_id in pose_selected_people,
+            callback=update_pose_person_selection,
+            user_data=track.track_id,
+            parent="pose_people_group",
+        )
+
+def merge_pose_tracks_callback(sender, app_data, user_data):
+    global pose_selected_people, pose_haptic_tracks, hap_signal, signal_at_coords
+    if pose_analysis is None:
+        _set_pose_status("Run YOLO Pose analysis before merging people.")
+        return
+
+    merge_ids_raw = dpg.get_value("pose_merge_ids") if dpg.does_item_exist("pose_merge_ids") else pose_merge_ids
+    try:
+        merge_ids = {int(part.strip()) for part in str(merge_ids_raw).replace(";", ",").split(",") if part.strip()}
+    except ValueError:
+        _set_pose_status("Enter person IDs as comma-separated numbers, for example: 1, 4, 7.")
+        return
+
+    merged_id = merge_person_tracks(pose_analysis, merge_ids)
+    if merged_id is None:
+        _set_pose_status("Select at least two valid person IDs to merge.")
+        return
+
+    pose_selected_people.difference_update(merge_ids)
+    pose_selected_people.add(merged_id)
+    pose_haptic_tracks = []
+    signal_at_coords = np.zeros(num_frames, dtype=float)
+    hap_signal = np.zeros(int(num_frames * (HAPTIC_SAMPLE_RATE / video_fs)), dtype=float)
+    _clear_pose_plot_series()
+    rebuild_pose_people_ui()
+    _set_pose_status(f"Merged people {sorted(merge_ids)} into Person {merged_id}. Generate body-part signals again.")
+    logger.log("Pose Tracks Merged", f"merge_ids={sorted(merge_ids)}, merged_id={merged_id}")
+
+def analyze_pose_callback(sender, app_data, user_data):
+    global pose_analysis, pose_selected_people
+    try:
+        show_loading_modal("Analyzing people with YOLO Pose...")
+        def on_progress(progress):
+            update_loading_text(f"Analyzing people with YOLO Pose... {progress:.1%}", dont_log=True)
+        pose_analysis = analyze_pose_video(
+            frames_rgb,
+            model_path=pose_model_path,
+            confidence=pose_confidence,
+            track_match_threshold=pose_track_match_threshold,
+            max_frame_gap=pose_max_frame_gap,
+            min_track_frames=pose_min_track_frames,
+            progress_callback=on_progress,
+        )
+        pose_selected_people = {track.track_id for track in pose_analysis.tracks}
+        rebuild_pose_people_ui()
+        _set_pose_status(f"Detected {len(pose_analysis.tracks)} people. Select people and body parts, then generate signals.")
+        logger.log("Pose Analysis Completed", f"tracks={len(pose_analysis.tracks)}, model={pose_model_path}, confidence={pose_confidence}, track_match_threshold={pose_track_match_threshold}, max_frame_gap={pose_max_frame_gap}, min_track_frames={pose_min_track_frames}")
+    except Exception as exc:
+        _set_pose_status(str(exc))
+        logger.log("Pose Analysis Failed", str(exc))
+    finally:
+        hide_loading_modal()
+
+def _pose_motion_matrix() -> np.ndarray:
+    if video_processing_method == VideoProcessingMethod.SPATIOTEMPORAL_SALIENCY.value:
+        return stsaliency
+    return mag_norm_all_sub if subtract_global_avg else mag_norm_all
+
+def _clear_pose_plot_series() -> None:
+    pose_track_plot_tags.clear()
+    if not dpg.does_item_exist(y_axis):
+        return
+    children = dpg.get_item_children(y_axis, slot=1) or []
+    for child in children:
+        alias = dpg.get_item_alias(child) or ""
+        if str(alias).startswith("pose_signal_"):
+            dpg.delete_item(child)
+
+def generate_pose_haptic_tracks_callback(sender, app_data, user_data):
+    global pose_haptic_tracks, hap_signal, signal_at_coords
+    if pose_analysis is None:
+        _set_pose_status("Run YOLO Pose analysis first.")
+        return
+    selected_tracks = _selected_pose_tracks()
+    selected_parts = sorted(pose_selected_body_parts)
+    if not selected_tracks or not selected_parts:
+        _set_pose_status("Select at least one person and one body part.")
+        return
+
+    show_loading_modal("Generating body-part haptic signals...")
+    pose_haptic_tracks = []
+    motion_matrix = _pose_motion_matrix()
+    x_vals = np.arange(0, num_frames).tolist()
+    _clear_pose_plot_series()
+
+    for track in selected_tracks:
+        for body_part in selected_parts:
+            body_signal: BodyPartSignal = extract_body_part_signal(
+                motion_matrix,
+                track,
+                body_part,
+                min_keypoint_confidence=pose_min_keypoint_confidence,
+            )
+            if not np.any(body_signal.valid_frames):
+                continue
+            track_hap_signal, *_ = create_hap_signal(body_signal.signal_at_coords, video_fs)
+            actuator_id = f"person_{track.track_id}_{body_part}"
+            pose_track = PoseHapticTrack(
+                person_id=track.track_id,
+                body_part=body_part,
+                actuator_id=actuator_id,
+                signal_at_coords=body_signal.signal_at_coords,
+                hap_signal=track_hap_signal,
+                valid_frames=body_signal.valid_frames,
+            )
+            pose_haptic_tracks.append(pose_track)
+
+            tag = f"pose_signal_{track.track_id}_{body_part}"
+            pose_track_plot_tags.append(tag)
+            if dpg.does_item_exist(y_axis):
+                dpg.add_line_series(x_vals, body_signal.signal_at_coords.tolist(), tag=tag, label=pose_track.label, parent=y_axis)
+
+    if pose_haptic_tracks:
+        signal_at_coords = pose_haptic_tracks[0].signal_at_coords
+        hap_signal = pose_haptic_tracks[0].hap_signal
+        send_pcm_signal_debounce(hap_signal)
+        _set_pose_status(f"Generated {len(pose_haptic_tracks)} separate haptic signals. Current Quest stream previews the first track.")
+    else:
+        _set_pose_status("No valid body-part signals were generated; check pose confidence or selected parts.")
+    logger.log("Pose Haptic Tracks Generated", f"tracks={len(pose_haptic_tracks)}, people={sorted(pose_selected_people)}, parts={selected_parts}")
+    hide_loading_modal()
+
 with dpg.group(horizontal=True, parent=primary_window) as gconout:
     with dpg.theme() as controls_theme:
         with dpg.theme_component(dpg.mvChildWindow):
@@ -863,6 +1058,38 @@ with dpg.group(horizontal=True, parent=primary_window) as gconout:
             )
             if user_study_participant_save_dir:
                 dpg.hide_item(video_processing_group)  # hide in user study mode
+        with dpg.collapsing_header(label="Pose Body-Part Haptics", default_open=False):
+            with dpg.group(horizontal=True):
+                dpg.add_text("YOLO model:")
+                dpg.add_input_text(tag="pose_model_path", default_value=pose_model_path, callback=update_global_render_param, user_data="pose_model_path", on_enter=True, width=160)
+            with dpg.group(horizontal=True):
+                dpg.add_text("Detection confidence:")
+                dpg.add_input_float(tag="pose_confidence", default_value=pose_confidence, min_value=0.01, max_value=1.0, min_clamped=True, max_clamped=True, callback=update_global_render_param, user_data="pose_confidence", on_enter=True, width=90)
+            with dpg.group(horizontal=True):
+                dpg.add_text("Tracking match threshold:")
+                dpg.add_input_float(tag="pose_track_match_threshold", default_value=pose_track_match_threshold, min_value=-1.0, max_value=1.0, min_clamped=True, max_clamped=True, callback=update_global_render_param, user_data="pose_track_match_threshold", on_enter=True, width=90)
+            with dpg.group(horizontal=True):
+                dpg.add_text("Max frame gap:")
+                dpg.add_input_int(tag="pose_max_frame_gap", default_value=pose_max_frame_gap, min_value=0, max_value=num_frames, min_clamped=True, max_clamped=True, callback=update_global_render_param, user_data="pose_max_frame_gap", on_enter=True, width=90)
+            with dpg.group(horizontal=True):
+                dpg.add_text("Minimum track frames:")
+                dpg.add_input_int(tag="pose_min_track_frames", default_value=pose_min_track_frames, min_value=1, max_value=num_frames, min_clamped=True, max_clamped=True, callback=update_global_render_param, user_data="pose_min_track_frames", on_enter=True, width=90)
+            with dpg.group(horizontal=True):
+                dpg.add_text("Keypoint confidence:")
+                dpg.add_input_float(tag="pose_min_keypoint_confidence", default_value=pose_min_keypoint_confidence, min_value=0.01, max_value=1.0, min_clamped=True, max_clamped=True, callback=update_global_render_param, user_data="pose_min_keypoint_confidence", on_enter=True, width=90)
+            dpg.add_button(label="Analyze People", callback=analyze_pose_callback)
+            dpg.add_text("People:")
+            dpg.add_group(tag="pose_people_group")
+            with dpg.group(horizontal=True):
+                dpg.add_text("Merge IDs:")
+                dpg.add_input_text(tag="pose_merge_ids", default_value=pose_merge_ids, callback=update_global_render_param, user_data="pose_merge_ids", on_enter=True, width=110)
+                dpg.add_button(label="Merge People", callback=merge_pose_tracks_callback)
+            dpg.add_text("Body parts:")
+            with dpg.group():
+                for body_part in BODY_PART_NAMES:
+                    dpg.add_checkbox(label=body_part, default_value=True, callback=update_pose_body_part_selection, user_data=body_part)
+            dpg.add_button(label="Generate Body-Part Signals", callback=generate_pose_haptic_tracks_callback)
+            dpg.add_text("Run analysis to detect people.", tag="pose_status", wrap=v_w - 20)
 
 
     with dpg.plot(label="Extracted Magnitude Signals", tag="extract_plot", height=v_h+30, width=v_w) as plot:
@@ -1014,9 +1241,13 @@ def reload_video(path: str):
     # cleanup_torch_state()  # untested
 
     global video_path, vid_idx, playback_start_time, motion_vol
+    global pose_analysis, pose_selected_people, pose_haptic_tracks
     video_path = path
     vid_idx = 0
     playback_start_time = None
+    pose_analysis = None
+    pose_selected_people = set()
+    pose_haptic_tracks = []
 
     motion_vol = None
     load_and_process_video(video_path)
@@ -1038,6 +1269,9 @@ def reload_video(path: str):
     dpg.set_value("signal_resampled_norm", [null_x, null_y])
     dpg.set_value("accel_resampled", [null_x, null_y])
     dpg.set_value("playback_head", [[0.0]])
+    if dpg.does_item_exist("pose_people_group"):
+        dpg.delete_item("pose_people_group", children_only=True)
+    _set_pose_status("Run analysis to detect people.")
     global signal_at_coords, hap_signal
     signal_at_coords = np.zeros(num_frames, dtype=float)
     hap_signal = np.zeros(int(num_frames * (HAPTIC_SAMPLE_RATE / video_fs)), dtype=float)
@@ -1262,6 +1496,14 @@ while dpg.is_dearpygui_running():
             bgr_hapsparkline = draw_sparkline(hap_signal, vid_perc, (hapspark_width, hapspark_height), -1, 1, playback_head_line=True)
 
             toc_sparklines = cv2.getTickCount()
+
+            if pose_analysis is not None:
+                pose_colors = [(255, 64, 64), (64, 180, 255), (90, 220, 120), (255, 190, 60)]
+                selected_parts = set(pose_selected_body_parts)
+                for i, track in enumerate(_selected_pose_tracks()):
+                    draw_pose_overlay(rgb_frame, track, vid_idx, selected_parts, color=pose_colors[i % len(pose_colors)])
+                    draw_pose_overlay(rgb_processed, track, vid_idx, selected_parts, color=pose_colors[i % len(pose_colors)])
+                    draw_pose_overlay(rgb_pda, track, vid_idx, selected_parts, color=pose_colors[i % len(pose_colors)])
 
             render_extract_point_rgb(rgb_frame, extract_point, extract_radius)
             render_extract_point_rgb(rgb_processed, extract_point, extract_radius)
